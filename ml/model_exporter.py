@@ -35,7 +35,7 @@ class ModelExporter:
         if missing:
             raise ValueError(f"Exported model is missing keys: {missing}")
 
-        print(f"  ✓ Model at {output.resolve()} is valid")
+        print(f"Model at {output.resolve()} is valid")
 
     def _serialize(self):
         return {
