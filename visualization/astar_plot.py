@@ -1,5 +1,4 @@
-import json
-import math
+import json, math, time, threading
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
@@ -7,11 +6,10 @@ from pathlib import Path
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
 from pathfinding.astar import Vector2i, find_path
 
 
-# ── State colours ─────────────────────────────────────────────────────────────
+# ── Colores por estado ────────────────────────────────────────────────────────
 STATE_COLORS = {
     "patrol":      "#378ADD",
     "alert":       "#EF9F27",
@@ -26,52 +24,40 @@ STATE_LABELS = {
 }
 
 
-# ── JSON Random Forest inference ──────────────────────────────────────────────
+# ── Inferencia sobre npc_model.json (sin scikit-learn) ───────────────────────
 class JSONForest:
-    """Runs inference on the serialised npc_model.json without scikit-learn."""
-
     def __init__(self, path: str = "models/npc_model.json"):
-        with open(path, "r") as f:
+        with open(path) as f:
             data = json.load(f)
         self._classes  = data["classes"]
         self._trees    = data["trees"]
         self._features = data["feature_names"]
 
     def predict(self, features: dict) -> str:
-        """
-        Parameters
-        ----------
-        features : dict  keys must match FEATURE_COLS
-        Returns the predicted class label (e.g. 'chase').
-        """
-        x = [features[k] for k in self._features]
+        x     = [features[k] for k in self._features]
         votes = [0] * len(self._classes)
         for tree in self._trees:
-            idx = self._predict_tree(tree, x)
-            votes[idx] += 1
+            votes[self._walk(tree, x)] += 1
         return self._classes[int(np.argmax(votes))]
 
-    def _predict_tree(self, node: dict, x: list) -> int:
+    def _walk(self, node: dict, x: list) -> int:
         if node["leaf"]:
             return node["class_idx"]
         if x[node["feature_index"]] <= node["threshold"]:
-            return self._predict_tree(node["left"], x)
-        return self._predict_tree(node["right"], x)
+            return self._walk(node["left"], x)
+        return self._walk(node["right"], x)
 
 
-# ── Grid manager ──────────────────────────────────────────────────────────────
+# ── Grid ──────────────────────────────────────────────────────────────────────
 class GridManager:
-    def __init__(self, width: int, height: int, walls: set):
-        self.width  = width
-        self.height = height
-        self._walls = walls
+    def __init__(self, width, height, walls):
+        self.width = width; self.height = height; self._walls = walls
 
     def is_walkable(self, pos: Vector2i) -> bool:
-        if not (0 <= pos.x < self.width and 0 <= pos.y < self.height):
-            return False
-        return (pos.x, pos.y) not in self._walls
+        return (0 <= pos.x < self.width and 0 <= pos.y < self.height
+                and (pos.x, pos.y) not in self._walls)
 
-    def wall_array(self) -> np.ndarray:
+    def wall_array(self):
         arr = np.zeros((self.height, self.width), dtype=bool)
         for (x, y) in self._walls:
             if 0 <= y < self.height and 0 <= x < self.width:
@@ -79,407 +65,390 @@ class GridManager:
         return arr
 
 
-# ── Pre-built house layout ────────────────────────────────────────────────────
+# ── Mapa de la casa ───────────────────────────────────────────────────────────
 class HouseMap:
-    WIDTH  = 20
-    HEIGHT = 16
-
+    WIDTH = 20; HEIGHT = 16
     PATROL_WAYPOINTS = [
-        Vector2i(4,  3),
-        Vector2i(14, 3),
-        Vector2i(9,  8),
-        Vector2i(4,  12),
-        Vector2i(14, 12),
+        Vector2i(4,3), Vector2i(14,3), Vector2i(9,8),
+        Vector2i(4,12), Vector2i(14,12),
     ]
-
-    INVESTIGATION_SPOTS = [
-        Vector2i(9, 6),
-        Vector2i(9, 9),
-        Vector2i(9, 1),
-    ]
-
     THIEF_POSITION = Vector2i(14, 12)
 
     @classmethod
     def default(cls) -> GridManager:
         walls = set()
         for x in range(cls.WIDTH):
-            walls.add((x, 0)); walls.add((x, cls.HEIGHT - 1))
+            walls.add((x,0)); walls.add((x, cls.HEIGHT-1))
         for y in range(cls.HEIGHT):
-            walls.add((0, y)); walls.add((cls.WIDTH - 1, y))
-        for y in range(1, 7):
-            walls.add((9, y))
-        for x in range(1, 9):
-            walls.add((x, 7))
-        for x in range(10, 19):
-            walls.add((x, 7))
-        for x in range(1, 9):
-            walls.add((x, 9))
-        for x in range(10, 19):
-            walls.add((x, 9))
-        for y in range(10, 15):
-            walls.add((9, y))
+            walls.add((0,y)); walls.add((cls.WIDTH-1, y))
+        for y in range(1,7):  walls.add((9,y))
+        for x in range(1,9):  walls.add((x,7))
+        for x in range(10,19): walls.add((x,7))
+        for x in range(1,9):  walls.add((x,9))
+        for x in range(10,19): walls.add((x,9))
+        for y in range(10,15): walls.add((9,y))
         for d in [(9,3),(4,7),(14,7),(4,9),(14,9)]:
             walls.discard(d)
         return GridManager(cls.WIDTH, cls.HEIGHT, walls)
 
     @classmethod
     def room_labels(cls):
-        return [
-            (4,  3,  "Living Room"),
-            (14, 3,  "Kitchen"),
-            (9,  8,  "Hallway"),
-            (4,  12, "Bedroom 1"),
-            (14, 12, "Bedroom 2"),
-        ]
+        return [(4,3,"Living Room"),(14,3,"Kitchen"),(9,8,"Hallway"),
+                (4,12,"Bedroom 1"),(14,12,"Bedroom 2")]
 
 
 # ── Feature builder ───────────────────────────────────────────────────────────
-def build_features(npc: Vector2i, thief: Vector2i, paranoia: float,
-                   noise: float, has_target: bool) -> dict:
-    """
-    Builds the 6-feature vector the RF model expects from game state.
-
-    player_visible     : 1 if thief is in the same room / adjacent tile
-    visibility_score   : decays with distance (0-1)
-    player_distance    : Euclidean pixel-equivalent distance
-    noise_level        : passed in directly (increases when thief moves)
-    paranoia_level     : accumulates over time
-    has_investigation_target : 1 if NPC has a waypoint to check
-    """
-    dist = math.sqrt((npc.x - thief.x)**2 + (npc.y - thief.y)**2)
-    visible = 1.0 if dist <= 3.0 else 0.0
+def build_features(npc: Vector2i, thief: Vector2i,
+                   paranoia: float, noise: float, has_target: bool) -> dict:
+    dist     = math.sqrt((npc.x-thief.x)**2 + (npc.y-thief.y)**2)
+    visible  = 1.0 if dist <= 3.0 else 0.0
     vis_score = max(0.0, 1.0 - dist / 20.0)
     return {
-        "player_visible":          visible,
-        "visibility_score":        round(vis_score, 4),
-        "player_distance":         round(dist * 10, 4),   # scale to match training data
-        "noise_level":             round(noise, 4),
-        "paranoia_level":          round(paranoia, 4),
+        "player_visible":           visible,
+        "visibility_score":         round(vis_score, 4),
+        "player_distance":          round(dist * 10, 4),
+        "noise_level":              round(noise, 4),
+        "paranoia_level":           round(paranoia, 4),
         "has_investigation_target": 1.0 if has_target else 0.0,
     }
 
 
-# ── Static plotter ────────────────────────────────────────────────────────────
+# ── Export estático ───────────────────────────────────────────────────────────
 class AStarPlot:
     def __init__(self, grid: GridManager, cell_size: int = 40):
         self._grid = grid
-        self._cell_size = cell_size
 
-    def find_path(self, start: Vector2i, goal: Vector2i) -> list:
+    def find_path(self, start, goal):
         return find_path(start, goal, self._grid)
 
     def show(self, path, *, npc_state="patrol", start=None, goal=None,
              title="NPC Pathfinding — A*"):
-        fig = self._build_figure(path, npc_state=npc_state, start=start,
-                                 goal=goal, title=title)
-        plt.show()
-        plt.close(fig)
+        fig = self._build(path, npc_state, start, goal, title)
+        plt.show(); plt.close(fig)
 
     def save(self, path, *, npc_state="patrol", start=None, goal=None,
-             title="NPC Pathfinding — A*", output_path="models/astar_plot.png",
-             dpi=120):
-        fig = self._build_figure(path, npc_state=npc_state, start=start,
-                                 goal=goal, title=title)
-        out = Path(output_path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out, dpi=dpi, bbox_inches="tight")
-        plt.close(fig)
+             title="NPC Pathfinding — A*", output_path="models/astar_plot.png", dpi=120):
+        fig = self._build(path, npc_state, start, goal, title)
+        out = Path(output_path); out.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out, dpi=dpi, bbox_inches="tight"); plt.close(fig)
         print(f"  A* plot saved → {out.resolve()}")
 
-    def _build_figure(self, path, *, npc_state, start, goal, title):
-        W, H   = self._grid.width, self._grid.height
-        walls  = self._grid.wall_array()
-        color  = STATE_COLORS.get(npc_state, "#888780")
-        label  = STATE_LABELS.get(npc_state, npc_state.upper())
+    def _build(self, path, npc_state, start, goal, title):
+        W, H  = self._grid.width, self._grid.height
+        walls = self._grid.wall_array()
+        color = STATE_COLORS.get(npc_state, "#888780")
+        label = STATE_LABELS.get(npc_state, npc_state.upper())
+        path_set = {(p.x,p.y) for p in path}
 
-        fig, ax = plt.subplots(figsize=(W * 0.6, H * 0.6))
-        fig.patch.set_facecolor("#1A1A2E")
-        ax.set_facecolor("#16213E")
-
-        path_set = set((p.x, p.y) for p in path)
+        fig, ax = plt.subplots(figsize=(W*.6, H*.6))
+        fig.patch.set_facecolor("#1A1A2E"); ax.set_facecolor("#16213E")
 
         for y in range(H):
             for x in range(W):
-                is_wall = walls[y, x]
-                if is_wall:
-                    fc = "#0F3460"; ec = "#0A2040"
-                elif (x, y) in path_set:
-                    fc = color + "28"; ec = "#1E2F50"
-                else:
-                    fc = "#1A2744"; ec = "#1E2F50"
-                ax.add_patch(mpatches.FancyBboxPatch(
-                    (x, H-1-y), 1, 1, boxstyle="square,pad=0",
-                    facecolor=fc, edgecolor=ec, linewidth=0.3))
+                iw = walls[y,x]
+                fc = "#0F3460" if iw else (color+"28" if (x,y) in path_set else "#1A2744")
+                ec = "#0A2040" if iw else "#1E2F50"
+                ax.add_patch(mpatches.FancyBboxPatch((x,H-1-y),1,1,
+                    boxstyle="square,pad=0",facecolor=fc,edgecolor=ec,linewidth=0.3))
 
-        for (rx, ry, lbl) in HouseMap.room_labels():
-            ax.text(rx+0.5, H-1-ry+0.5, lbl, ha="center", va="center",
-                    fontsize=6.5, color="#8899AA", alpha=0.7, zorder=3,
-                    fontfamily="monospace")
+        for rx,ry,lbl in HouseMap.room_labels():
+            ax.text(rx+.5,H-1-ry+.5,lbl,ha="center",va="center",
+                    fontsize=6.5,color="#8899AA",alpha=.7,zorder=3,fontfamily="monospace")
 
         for wp in HouseMap.PATROL_WAYPOINTS:
-            ax.plot(wp.x+0.5, H-1-wp.y+0.5, "o", color="#378ADD",
-                    markersize=5, zorder=5, alpha=0.5)
+            ax.plot(wp.x+.5,H-1-wp.y+.5,"o",color="#378ADD",markersize=5,zorder=5,alpha=.5)
 
-        if path and len(path) > 1:
-            xs = [p.x+0.5 for p in path]
-            ys = [H-1-p.y+0.5 for p in path]
-            ax.plot(xs, ys, color=color, linewidth=2.5, zorder=4,
-                    solid_capstyle="round", solid_joinstyle="round", alpha=0.85)
+        if len(path)>1:
+            ax.plot([p.x+.5 for p in path],[H-1-p.y+.5 for p in path],
+                    color=color,linewidth=2.5,zorder=4,
+                    solid_capstyle="round",solid_joinstyle="round",alpha=.85)
 
         if start:
-            ax.plot(start.x+0.5, H-1-start.y+0.5, "s", color="#5DCAA5",
-                    markersize=10, zorder=6,
-                    markeredgecolor="#1A1A2E", markeredgewidth=1.2)
-            ax.text(start.x+0.5, H-1-start.y+0.5, "NPC", ha="center",
-                    va="center", fontsize=5.5, color="#1A1A2E",
-                    fontweight="bold", zorder=7)
+            ax.add_patch(mpatches.FancyBboxPatch((start.x+.15,H-1-start.y+.15),.7,.7,
+                boxstyle="round,pad=0.05",facecolor="#5DCAA5",edgecolor="#1A1A2E",linewidth=1.2,zorder=7))
+            ax.text(start.x+.5,H-1-start.y+.5,"NPC",ha="center",va="center",
+                    fontsize=5.5,color="#1A1A2E",fontweight="bold",zorder=8)
 
         t = goal or HouseMap.THIEF_POSITION
-        ax.plot(t.x+0.5, H-1-t.y+0.5, "*", color="#E24B4A", markersize=14,
-                zorder=6, markeredgecolor="#1A1A2E", markeredgewidth=0.8)
-        ax.text(t.x+0.5, H-1-t.y-0.1, "THIEF", ha="center", va="top",
-                fontsize=5, color="#E24B4A", zorder=7, fontfamily="monospace")
+        ax.text(t.x+.5,H-1-t.y+.5,"★",ha="center",va="center",
+                fontsize=14,color="#E24B4A",zorder=7)
 
-        ax.text(W*0.98, H*0.98, f"● {label}", ha="right", va="top",
-                fontsize=8, color=color, fontweight="bold",
-                fontfamily="monospace", zorder=8)
+        ax.text(W-.2,H-.3,f"● {label}",ha="right",va="top",fontsize=9,
+                color=color,fontweight="bold",fontfamily="monospace",zorder=9)
 
-        legend_elements = [
-            mpatches.Patch(facecolor="#0F3460", edgecolor="#0A2040", label="Wall"),
-            mpatches.Patch(facecolor="#1A2744", edgecolor="#1E2F50", label="Walkable"),
-            plt.Line2D([0],[0], color=color, linewidth=2, label=f"Path ({label})"),
-            plt.Line2D([0],[0], marker="o", color="none",
-                       markerfacecolor="#378ADD", markersize=6, label="Patrol waypoint"),
-            plt.Line2D([0],[0], marker="s", color="none",
-                       markerfacecolor="#5DCAA5", markersize=8, label="NPC (homeowner)"),
-            plt.Line2D([0],[0], marker="*", color="none",
-                       markerfacecolor="#E24B4A", markersize=10, label="Thief"),
+        legend_els = [
+            mpatches.Patch(facecolor="#0F3460",edgecolor="#0A2040",label="Wall"),
+            mpatches.Patch(facecolor="#1A2744",edgecolor="#1E2F50",label="Walkable"),
+            plt.Line2D([0],[0],color=color,linewidth=2,label=f"Path ({label})"),
+            plt.Line2D([0],[0],marker="o",color="none",markerfacecolor="#378ADD",markersize=6,label="Patrol wp"),
+            plt.Line2D([0],[0],marker="s",color="none",markerfacecolor="#5DCAA5",markersize=8,label="NPC"),
+            plt.Line2D([0],[0],marker="*",color="none",markerfacecolor="#E24B4A",markersize=10,label="Thief"),
         ]
-        ax.legend(handles=legend_elements, loc="lower right", fontsize=6.5,
-                  facecolor="#0F3460", edgecolor="#1E2F50",
-                  labelcolor="white", framealpha=0.9)
-
-        ax.set_xlim(0, W); ax.set_ylim(0, H)
-        ax.set_aspect("equal"); ax.axis("off")
-        fig.suptitle(title, fontsize=11, color="white",
-                     fontfamily="monospace", y=0.97)
+        ax.legend(handles=legend_els,loc="lower right",fontsize=6.5,
+                  facecolor="#0F3460",edgecolor="#1E2F50",labelcolor="white",framealpha=.9)
+        ax.set_xlim(0,W); ax.set_ylim(0,H); ax.set_aspect("equal"); ax.axis("off")
+        fig.suptitle(title,fontsize=11,color="white",fontfamily="monospace",y=.97)
         return fig
 
 
-# ── Interactive game mode ─────────────────────────────────────────────────────
+# ── Minijuego interactivo ─────────────────────────────────────────────────────
 class InteractiveGame:
-    """
-    Arrow keys move the thief.
-    The homeowner follows via A* and the RF model decides its state each step.
 
-    Parameters
-    ----------
-    model_path : str   path to models/npc_model.json
-    """
+    FPS            = 2         # ticks por segundo del NPC
+    NPC_STEPS_TICK = 1         # tiles que avanza el NPC por tick
 
-    NOISE_ON_MOVE   = 0.25
-    NOISE_DECAY     = 0.05
-    PARANOIA_GAIN   = 0.03
-    PARANOIA_DECAY  = 0.005
-    NPC_STEP_EVERY  = 2    # NPC moves 1 tile every N thief moves
+    # Parámetros de simulación calibrados con los rangos del dataset
+    NOISE_ON_MOVE    = 0.10    # ruido que genera cada paso del ladrón
+    NOISE_DECAY      = 0.20    # decae por tick sin estímulo
+    PARANOIA_GAIN    = 0.01    # sube cuando hay alerta/investigación/chase
+    PARANOIA_DECAY   = 0.08   # decae por tick sin estímulo (cooldown Godot)
+    PARANOIA_FLOOR   = 0.0     # mínimo absoluto
+    PARANOIA_CEIL    = 1.0
 
     def __init__(self, model_path: str = "models/npc_model.json"):
-        self._grid    = HouseMap.default()
-        self._forest  = JSONForest(model_path)
+        self._grid   = HouseMap.default()
+        self._forest = JSONForest(model_path)
 
-        # Positions
-        self._thief   = Vector2i(HouseMap.THIEF_POSITION.x,
-                                 HouseMap.THIEF_POSITION.y)
-        self._npc     = Vector2i(HouseMap.PATROL_WAYPOINTS[0].x,
-                                 HouseMap.PATROL_WAYPOINTS[0].y)
+        self._thief = Vector2i(HouseMap.THIEF_POSITION.x, HouseMap.THIEF_POSITION.y)
+        self._npc   = Vector2i(HouseMap.PATROL_WAYPOINTS[0].x,
+                               HouseMap.PATROL_WAYPOINTS[0].y)
 
-        # Simulation state
-        self._paranoia     = 0.0
-        self._noise        = 0.0
-        self._has_target   = False
-        self._npc_state    = "patrol"
-        self._path: list   = []
-        self._step_counter = 0
-        self._move_log: list[str] = []
+        self._paranoia   = 0.0
+        self._noise      = 0.0
+        self._has_target = False
+        self._npc_state  = "patrol"
+        self._path: list = []
 
-        self._build_canvas()
-        self._update()
+        # Patrol waypoint cycling cuando está en patrol
+        self._wp_idx     = 0
 
-    # ── Canvas setup ──────────────────────────────────────────────────────────
-    def _build_canvas(self):
-        W, H = self._grid.width, self._grid.height
-        self._fig, self._ax = plt.subplots(figsize=(W * 0.65, H * 0.65 + 1))
+        self._keys_pressed: set = set()
+        self._lock = threading.Lock()
+        self._running = True
+
+        self._fig, self._ax = plt.subplots(figsize=(14, 10))
         self._fig.patch.set_facecolor("#1A1A2E")
         self._ax.set_facecolor("#16213E")
-        self._fig.canvas.mpl_connect("key_press_event", self._on_key)
+        self._fig.canvas.mpl_connect("key_press_event",  self._on_key_press)
+        self._fig.canvas.mpl_connect("close_event",      self._on_close)
         self._fig.suptitle(
-            "NPC AI  —  Arrow keys: move thief  |  Q: quit",
-            fontsize=9, color="#8899AA", fontfamily="monospace", y=0.99,
-        )
+            "NPC AI Minijuego  ·  Flechas: mover ladrón  ·  Q: salir",
+            fontsize=9, color="#8899AA", fontfamily="monospace", y=.995)
+
+        self._update_path()
+        self._redraw()
 
     # ── Input ─────────────────────────────────────────────────────────────────
-    def _on_key(self, event):
-        DIRS = {
-            "up":    Vector2i(0, -1),
-            "down":  Vector2i(0,  1),
-            "left":  Vector2i(-1, 0),
-            "right": Vector2i(1,  0),
-        }
+    def _on_key_press(self, event):
+        DIRS = {"up":Vector2i(0,-1),"down":Vector2i(0,1),
+                "left":Vector2i(-1,0),"right":Vector2i(1,0)}
         if event.key == "q":
-            plt.close(self._fig)
-            return
-        if event.key not in DIRS:
-            return
+            self._running = False; plt.close(self._fig); return
 
-        d   = DIRS[event.key]
-        nxt = Vector2i(self._thief.x + d.x, self._thief.y + d.y)
-        if not self._grid.is_walkable(nxt):
-            return
+        if event.key in DIRS:
+            d   = DIRS[event.key]
+            nxt = Vector2i(self._thief.x+d.x, self._thief.y+d.y)
+            if self._grid.is_walkable(nxt):
+                with self._lock:
+                    self._thief = nxt
+                    self._noise = min(self.PARANOIA_CEIL,
+                                     self._noise + self.NOISE_ON_MOVE)
 
-        self._thief = nxt
-        self._noise = min(1.0, self._noise + self.NOISE_ON_MOVE)
-        self._step_counter += 1
+    def _on_close(self, event):
+        self._running = False
 
-        # Advance NPC one step along path every N thief moves
-        if self._step_counter % self.NPC_STEP_EVERY == 0 and self._path:
-            next_npc = self._path[1] if len(self._path) > 1 else self._path[0]
-            self._npc = next_npc
+    # ── Game loop (hilo separado) ─────────────────────────────────────────────
+    def _game_loop(self):
+        interval = 1.0 / self.FPS
+        while self._running:
+            t0 = time.perf_counter()
+            with self._lock:
+                self._tick()
+            # Solicitar redibujado en el hilo principal
+            try:
+                self._fig.canvas.draw_idle()
+                self._fig.canvas.flush_events()
+            except Exception:
+                break
+            elapsed = time.perf_counter() - t0
+            time.sleep(max(0.0, interval - elapsed))
 
-        self._update()
+    # ── Un tick del NPC ───────────────────────────────────────────────────────
+    def _tick(self):
+        # 1. Decaimiento pasivo
+        self._noise    = max(self.PARANOIA_FLOOR,
+                             self._noise - self.NOISE_DECAY)
+        self._paranoia = max(self.PARANOIA_FLOOR,
+                             self._paranoia - self.PARANOIA_DECAY)
 
-    # ── Simulation step ───────────────────────────────────────────────────────
-    def _update(self):
-        # Decay noise & paranoia
-        self._noise    = max(0.0, self._noise    - self.NOISE_DECAY)
-        self._paranoia = max(0.0, self._paranoia - self.PARANOIA_DECAY)
-
-        # Build features & predict state
-        feats = build_features(
-            self._npc, self._thief,
-            self._paranoia, self._noise, self._has_target,
-        )
+        # 2. Predicción del modelo
+        feats = build_features(self._npc, self._thief,
+                               self._paranoia, self._noise, self._has_target)
         self._npc_state = self._forest.predict(feats)
 
-        # Paranoia grows when alerted or chasing
+        # 3. Actualizar paranoia y has_target según estado predicho
         if self._npc_state in ("alert", "investigate", "chase"):
-            self._paranoia = min(1.0, self._paranoia + self.PARANOIA_GAIN)
+            self._paranoia   = min(self.PARANOIA_CEIL,
+                                   self._paranoia + self.PARANOIA_GAIN)
             self._has_target = True
         else:
-            self._has_target = False
+            # patrol: si paranoia ya bajó, olvidó al ladrón
+            if self._paranoia < 0.3:
+                self._has_target = False
 
-        # Recompute A* path NPC → Thief
-        self._path = find_path(self._npc, self._thief, self._grid)
+        # 4. Mover NPC por el path
+        self._update_path()
+        if self._path and len(self._path) > 1:
+            self._npc = self._path[1]
 
-        self._redraw(feats)
+        # 5. Redibujar
+        self._redraw()
 
-    # ── Drawing ───────────────────────────────────────────────────────────────
-    def _redraw(self, feats: dict):
-        ax  = self._ax
-        ax.cla()
-        ax.set_facecolor("#16213E")
+    # ── Pathfinding ───────────────────────────────────────────────────────────
+    def _update_path(self):
+        if self._npc_state == "patrol":
+            # Cicla entre waypoints cuando no hay estímulos
+            goal = HouseMap.PATROL_WAYPOINTS[self._wp_idx]
+            if self._npc.x == goal.x and self._npc.y == goal.y:
+                self._wp_idx = (self._wp_idx + 1) % len(HouseMap.PATROL_WAYPOINTS)
+                goal = HouseMap.PATROL_WAYPOINTS[self._wp_idx]
+        else:
+            goal = self._thief
+
+        self._path = find_path(self._npc, goal, self._grid)
+
+    # ── Dibujo ────────────────────────────────────────────────────────────────
+    def _redraw(self):
+        ax = self._ax; ax.cla(); ax.set_facecolor("#16213E")
         W, H   = self._grid.width, self._grid.height
         walls  = self._grid.wall_array()
         color  = STATE_COLORS[self._npc_state]
         label  = STATE_LABELS[self._npc_state]
-        path_set = set((p.x, p.y) for p in self._path)
+        path_set = {(p.x,p.y) for p in self._path}
 
-        # Grid cells
+        # Celdas
         for y in range(H):
             for x in range(W):
-                is_wall = walls[y, x]
-                if is_wall:
-                    fc = "#0F3460"; ec = "#0A2040"
-                elif (x, y) in path_set:
-                    fc = color + "28"; ec = "#1E2F50"
-                else:
-                    fc = "#1A2744"; ec = "#1E2F50"
+                iw = walls[y,x]
+                fc = ("#0F3460" if iw
+                      else color+"22" if (x,y) in path_set
+                      else "#1A2744")
+                ec = "#0A2040" if iw else "#1E2F50"
                 ax.add_patch(mpatches.FancyBboxPatch(
-                    (x, H-1-y), 1, 1, boxstyle="square,pad=0",
-                    facecolor=fc, edgecolor=ec, linewidth=0.3))
+                    (x,H-1-y),1,1,boxstyle="square,pad=0",
+                    facecolor=fc,edgecolor=ec,linewidth=0.3))
 
-        # Room labels
-        for (rx, ry, lbl) in HouseMap.room_labels():
-            ax.text(rx+0.5, H-1-ry+0.5, lbl, ha="center", va="center",
-                    fontsize=6, color="#8899AA", alpha=0.55, zorder=3,
+        # Etiquetas de habitación
+        for rx,ry,lbl in HouseMap.room_labels():
+            ax.text(rx+.5,H-1-ry+.5,lbl,ha="center",va="center",
+                    fontsize=6,color="#8899AA",alpha=.5,zorder=3,
                     fontfamily="monospace")
 
-        # Patrol waypoints
-        for wp in HouseMap.PATROL_WAYPOINTS:
-            ax.plot(wp.x+0.5, H-1-wp.y+0.5, "o", color="#378ADD",
-                    markersize=4, zorder=4, alpha=0.35)
+        # Waypoints de patrulla
+        for i,wp in enumerate(HouseMap.PATROL_WAYPOINTS):
+            alpha = .9 if (self._npc_state=="patrol" and
+                           i==self._wp_idx) else .3
+            ax.plot(wp.x+.5,H-1-wp.y+.5,"o",color="#378ADD",
+                    markersize=5,zorder=4,alpha=alpha)
 
-        # Path line
-        if self._path and len(self._path) > 1:
-            xs = [p.x+0.5 for p in self._path]
-            ys = [H-1-p.y+0.5 for p in self._path]
-            ax.plot(xs, ys, color=color, linewidth=2, zorder=5,
-                    solid_capstyle="round", solid_joinstyle="round", alpha=0.75)
+        # Línea del path
+        if len(self._path) > 1:
+            ax.plot([p.x+.5 for p in self._path],
+                    [H-1-p.y+.5 for p in self._path],
+                    color=color,linewidth=2,zorder=5,
+                    solid_capstyle="round",solid_joinstyle="round",alpha=.7)
 
-        # NPC marker
-        nx, ny = self._npc.x, self._npc.y
+        # NPC
+        nx,ny = self._npc.x, self._npc.y
         ax.add_patch(mpatches.FancyBboxPatch(
-            (nx+0.15, H-1-ny+0.15), 0.7, 0.7,
-            boxstyle="round,pad=0.05",
-            facecolor="#5DCAA5", edgecolor="#1A1A2E",
-            linewidth=1.2, zorder=7))
-        ax.text(nx+0.5, H-1-ny+0.5, "NPC", ha="center", va="center",
-                fontsize=5.5, color="#1A1A2E", fontweight="bold", zorder=8)
+            (nx+.1,H-1-ny+.1),.8,.8,boxstyle="round,pad=0.06",
+            facecolor="#5DCAA5",edgecolor=color,linewidth=2,zorder=7))
+        ax.text(nx+.5,H-1-ny+.5,"NPC",ha="center",va="center",
+                fontsize=6,color="#1A1A2E",fontweight="bold",zorder=8)
 
-        # Thief marker
-        tx, ty = self._thief.x, self._thief.y
-        ax.text(tx+0.5, H-1-ty+0.5, "★", ha="center", va="center",
-                fontsize=14, color="#E24B4A", zorder=7)
+        # Ladrón
+        tx,ty = self._thief.x, self._thief.y
+        ax.text(tx+.5,H-1-ty+.5,"★",ha="center",va="center",
+                fontsize=15,color="#E24B4A",zorder=7)
+        ax.text(tx+.5,H-1-ty-.05,"ladrón",ha="center",va="top",
+                fontsize=5,color="#E24B4A",fontfamily="monospace",zorder=8)
 
-        # State badge (top-right)
-        ax.text(W-0.2, H-0.3, f"● {label}", ha="right", va="top",
-                fontsize=9, color=color, fontweight="bold",
-                fontfamily="monospace", zorder=9)
+        # Badge de estado
+        ax.text(W-.2,H-.25,f"● {label}",ha="right",va="top",
+                fontsize=10,color=color,fontweight="bold",
+                fontfamily="monospace",zorder=9)
 
-        # HUD — feature values (bottom panel)
-        hud_lines = [
-            f"distance     {feats['player_distance']:6.1f}",
-            f"visibility   {feats['visibility_score']:6.3f}",
-            f"noise        {feats['noise_level']:6.3f}",
-            f"paranoia     {feats['paranoia_level']:6.3f}",
-            f"visible      {'YES' if feats['player_visible'] else 'NO ':>3}",
-            f"has_target   {'YES' if feats['has_investigation_target'] else 'NO ':>3}",
+        # HUD de features (panel inferior)
+        feats = build_features(self._npc,self._thief,
+                               self._paranoia,self._noise,self._has_target)
+
+        hud = [
+            ("dist",      f"{feats['player_distance']:5.1f}"),
+            ("visib",     f"{feats['visibility_score']:.3f}"),
+            ("noise",     f"{feats['noise_level']:.3f}"),
+            ("paranoia",  f"{feats['paranoia_level']:.3f}"),
+            ("visible",   "SÍ " if feats['player_visible'] else "NO "),
+            ("has_tgt",   "SÍ " if feats['has_investigation_target'] else "NO "),
         ]
-        hud_x = [0.5, 4.0, 8.0, 11.5, 15.0, 17.5]
-        for i, line in enumerate(hud_lines):
-            ax.text(hud_x[i], -0.6, line, ha="left", va="top",
-                    fontsize=6.5, color="#8899AA", fontfamily="monospace", zorder=9)
 
-        ax.set_xlim(0, W); ax.set_ylim(-1.2, H)
+        # Barras de progreso para noise y paranoia
+        def bar(val, w=10):
+            filled = int(val * w)
+            return "█"*filled + "░"*(w-filled)
+
+        for i,(k,v) in enumerate(hud):
+            x_pos = 0.6 + i*3.3
+            ax.text(x_pos,-0.45,k,ha="left",va="top",fontsize=6,
+                    color="#556677",fontfamily="monospace",zorder=9)
+            ax.text(x_pos,-0.85,v,ha="left",va="top",fontsize=7.5,
+                    color="#AABBCC",fontfamily="monospace",fontweight="bold",zorder=9)
+
+        # Barra visual de paranoia
+        ax.text(0.6,-1.3,
+                f"paranoia  {bar(self._paranoia)}  "
+                f"noise  {bar(self._noise)}",
+                ha="left",va="top",fontsize=6.5,
+                color=color,fontfamily="monospace",zorder=9)
+
+        # Cooldown hint
+        if self._npc_state in ("alert","investigate") and self._paranoia < 0.35:
+            ax.text(W/2,-1.3,"← perdiendo rastro...",ha="center",va="top",
+                    fontsize=7,color="#EF9F27",fontfamily="monospace",
+                    alpha=.8,zorder=9)
+        elif self._npc_state == "patrol" and self._paranoia < 0.05:
+            ax.text(W/2,-1.3,"patrol normal",ha="center",va="top",
+                    fontsize=7,color="#378ADD",fontfamily="monospace",
+                    alpha=.6,zorder=9)
+
+        ax.set_xlim(0,W); ax.set_ylim(-1.7,H)
         ax.set_aspect("equal"); ax.axis("off")
-        self._fig.canvas.draw_idle()
 
     def run(self):
-        plt.tight_layout()
+        t = threading.Thread(target=self._game_loop, daemon=True)
+        t.start()
         plt.show()
+        self._running = False
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import sys
     MODEL = "models/npc_model.json"
-
     if not Path(MODEL).exists():
-        print(f"  ⚠  Model not found at '{MODEL}'.")
-        print("  Run 'python train.py' first to generate it.\n")
-        print("  Falling back to static export demo...\n")
+        print(f"  ⚠  Modelo no encontrado en '{MODEL}'.")
+        print("  Corre 'python train.py' primero.\n")
+        print("  Mostrando demo estático...\n")
         grid  = HouseMap.default()
         plot  = AStarPlot(grid)
         start = HouseMap.PATROL_WAYPOINTS[0]
         goal  = HouseMap.THIEF_POSITION
         path  = plot.find_path(start, goal)
-        for state in ["patrol", "alert", "investigate", "chase"]:
+        for state in ["patrol","alert","investigate","chase"]:
             plot.save(path, npc_state=state, start=start, goal=goal,
                       title=f"NPC A* Path — {state.capitalize()}",
                       output_path=f"models/astar_{state}.png")
         plot.show(path, npc_state="chase", start=start, goal=goal)
     else:
-        print("  Starting interactive game mode...")
-        print("  Arrow keys → move thief  |  Q → quit\n")
+        print("  Iniciando minijuego interactivo...")
+        print("  Flechas → mover ladrón  |  Q → salir\n")
         game = InteractiveGame(MODEL)
         game.run()
