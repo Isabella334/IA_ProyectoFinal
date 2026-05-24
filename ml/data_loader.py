@@ -1,8 +1,8 @@
 import pandas as pd
 from dataclasses import dataclass
-from sklearn.model_selection import train_test_split
 from ml.data_cleaner import DataCleaner
-from ml.config import FEATURE_COLS, TARGET_COL, TEST_SIZE, RANDOM_STATE
+from ml.config import FEATURE_COLS, RANDOM_STATE, TARGET_COL, TEST_SIZE
+from sklearn.model_selection import train_test_split
 
 @dataclass
 class SplitData:
@@ -47,17 +47,17 @@ class DataLoader:
         cleaner = DataCleaner(df)
         return cleaner.clean()
 
-    def _split(self, df) -> SplitData:
+    def _split(self, df: pd.DataFrame) -> SplitData:
         X = df[FEATURE_COLS]
         y = df[TARGET_COL]
-
+ 
         X_train, X_test, y_train, y_test = train_test_split(
             X, y,
             test_size=TEST_SIZE,
             random_state=RANDOM_STATE,
             stratify=y,
         )
-
+ 
         return SplitData(
             X_train=X_train.reset_index(drop=True),
             X_test=X_test.reset_index(drop=True),
