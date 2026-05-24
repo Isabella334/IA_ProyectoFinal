@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 
-DATA_PATH = "./data/training_data.csv"
+DATA_PATH = "./data/training_data_sim.csv"
 TARGET_COL = "action"
 SEP = "─" * 55
 

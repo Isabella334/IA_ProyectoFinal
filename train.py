@@ -4,7 +4,7 @@ from ml.model_trainer import ModelTrainer
 from ml.model_exporter import ModelExporter
 from visualization.training_report import TrainingReport
 
-loader = DataLoader("./data/training_data.csv")
+loader = DataLoader("./data/training_data_sim.csv")
 data = loader.load()
 
 trainer = ModelTrainer()
