@@ -1,3 +1,30 @@
+"""
+visualizations/astar_plot.py
+
+Modos de uso
+------------
+Static export:
+    from visualizations.astar_plot import AStarPlot, HouseMap
+    plot = AStarPlot(HouseMap.default())
+    path = plot.find_path(start, goal)
+    plot.save(path, npc_state="chase", output_path="models/astar_chase.png")
+
+Interactive game (teclado):
+    python -m visualizations.astar_plot
+    Flechas : mover ladrón
+    Q       : salir
+
+Lógica de estados (espeja Godot)
+---------------------------------
+    patrol      → sin estímulos, paranoia < 0.3
+    alert       → sin estímulos pero paranoia >= 0.3  (recuerda algo)
+    investigate → has_target=1, oyó ruido, no necesariamente ve al ladrón
+    chase       → player_visible=1, visibility > 0.5
+    
+    Si el NPC deja de ver/escuchar al ladrón, la paranoia decae.
+    Cuando baja de 0.3 el modelo predice patrol de nuevo.
+"""
+
 import json, math, time, threading
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -199,6 +226,13 @@ class AStarPlot:
         return fig
 
 
+# Umbrales reales del modelo (extraídos de npc_model.json)
+# Usados en _tick para detectar estímulos reales
+NOISE_THRESHOLD      = 0.0025
+VISIBILITY_THRESHOLD = 0.4998
+PARANOIA_THRESHOLD   = 0.2996
+
+
 # ── Minijuego interactivo ─────────────────────────────────────────────────────
 class InteractiveGame:
     """
@@ -228,6 +262,10 @@ class InteractiveGame:
     PARANOIA_DECAY_HIDDEN = 0.05   # decae mucho más rápido al esconderse
     HIDE_RANGE            = 1.5    # distancia máxima (tiles) para activar E
 
+    # Timer de has_target — ticks sin estímulo antes de olvidar al ladrón
+    # A 4 FPS: 12 ticks = ~3 segundos. Evita el loop infinito investigate↔has_target
+    HAS_TARGET_TIMEOUT    = 12
+
     def __init__(self, model_path: str = "models/npc_model.json"):
         self._grid   = HouseMap.default()
         self._forest = JSONForest(model_path)
@@ -236,12 +274,19 @@ class InteractiveGame:
         self._npc   = Vector2i(HouseMap.PATROL_WAYPOINTS[0].x,
                                HouseMap.PATROL_WAYPOINTS[0].y)
 
-        self._paranoia   = 0.0
-        self._noise      = 0.0
-        self._has_target = False
-        self._npc_state  = "patrol"
-        self._path: list = []
-        self._hidden     = False   # ladrón escondido en caja
+        self._paranoia         = 0.0
+        self._noise            = 0.0
+        self._has_target       = False
+        self._has_target_ticks = 0    # timer: ticks sin estímulo real
+        self._npc_state        = "patrol"
+        self._path: list       = []
+        self._hidden           = False
+
+        # Última posición donde el NPC tuvo un estímulo real del ladrón.
+        # El path va aquí, NO a self._thief — el NPC no tiene "superpoder".
+        # Se actualiza solo cuando hay visibilidad, ruido o contacto directo.
+        self._last_known_pos: Vector2i = Vector2i(HouseMap.PATROL_WAYPOINTS[0].x,
+                                                   HouseMap.PATROL_WAYPOINTS[0].y)
 
         # Patrol waypoint cycling cuando está en patrol
         self._wp_idx     = 0
@@ -326,59 +371,86 @@ class InteractiveGame:
 
     # ── Un tick del NPC ───────────────────────────────────────────────────────
     def _tick(self):
-        # 1. Decaimiento pasivo — más rápido si el ladrón está escondido
+        # 1. Decaimiento pasivo
         decay = self.PARANOIA_DECAY_HIDDEN if self._hidden else self.PARANOIA_DECAY
-        self._noise    = max(self.PARANOIA_FLOOR,
-                             self._noise - self.NOISE_DECAY)
-        self._paranoia = max(self.PARANOIA_FLOOR,
-                             self._paranoia - decay)
+        self._noise    = max(self.PARANOIA_FLOOR, self._noise - self.NOISE_DECAY)
+        self._paranoia = max(self.PARANOIA_FLOOR, self._paranoia - decay)
 
-        # 2. Predicción del modelo
-        # Si está escondido → invisible y sin ruido para el modelo
-        feats = build_features(
-            self._npc, self._thief,
-            self._paranoia,
-            0.0 if self._hidden else self._noise,
-            self._has_target,
-        )
+        # 2. Escondido → el ladrón desaparece inmediatamente
+        #    has_target se apaga en el mismo tick, sin timer
         if self._hidden:
+            self._has_target       = False
+            self._has_target_ticks = 0
+            feats = build_features(
+                self._npc, self._last_known_pos,
+                self._paranoia, 0.0, False,
+            )
             feats["player_visible"]   = 0.0
             feats["visibility_score"] = 0.0
+            self._npc_state = self._forest.predict(feats)
+            self._update_path()
+            if self._path and len(self._path) > 1:
+                self._npc = self._path[1]
+            self._redraw(feats)
+            return
+
+        # 3. No escondido — construir features reales
+        feats = build_features(
+            self._npc, self._thief,
+            self._paranoia, self._noise, self._has_target,
+        )
         self._npc_state = self._forest.predict(feats)
 
-        # 3. Actualizar paranoia y has_target según estado predicho
-        if self._npc_state in ("alert", "investigate", "chase"):
-            self._paranoia   = min(self.PARANOIA_CEIL,
-                                   self._paranoia + self.PARANOIA_GAIN)
-            self._has_target = True
-        else:
-            # patrol: si paranoia ya bajó, olvidó al ladrón
-            if self._paranoia < 0.3:
-                self._has_target = False
+        # 4. Estímulo real
+        hay_estimulo = (feats["player_visible"] == 1.0 or
+                        feats["noise_level"]     > NOISE_THRESHOLD or
+                        feats["visibility_score"] > VISIBILITY_THRESHOLD)
 
-        # 4. Mover NPC por el path
+        if hay_estimulo:
+            self._last_known_pos   = Vector2i(self._thief.x, self._thief.y)
+            self._has_target       = True
+            self._has_target_ticks = 0
+            self._paranoia = min(self.PARANOIA_CEIL,
+                                 self._paranoia + self.PARANOIA_GAIN)
+        else:
+            if self._has_target:
+                # NPC llegó a last_known_pos y no encontró nada → olvidar
+                npc_at_goal = (self._npc.x == self._last_known_pos.x and
+                               self._npc.y == self._last_known_pos.y)
+                if npc_at_goal:
+                    self._has_target       = False
+                    self._has_target_ticks = 0
+                else:
+                    # Todavía en camino — timer de seguridad por si el path falla
+                    self._has_target_ticks += 1
+                    if self._has_target_ticks >= self.HAS_TARGET_TIMEOUT:
+                        self._has_target       = False
+                        self._has_target_ticks = 0
+
+        # 5. Mover NPC
         self._update_path()
         if self._path and len(self._path) > 1:
             self._npc = self._path[1]
 
-        # 5. Redibujar
-        self._redraw()
+        # 6. Redibujar
+        self._redraw(feats)
 
     # ── Pathfinding ───────────────────────────────────────────────────────────
     def _update_path(self):
-        if self._npc_state == "patrol":
-            # Cicla entre waypoints cuando no hay estímulos
+        if not self._has_target:
+            # Sin objetivo → ciclar waypoints normalmente
             goal = HouseMap.PATROL_WAYPOINTS[self._wp_idx]
             if self._npc.x == goal.x and self._npc.y == goal.y:
                 self._wp_idx = (self._wp_idx + 1) % len(HouseMap.PATROL_WAYPOINTS)
                 goal = HouseMap.PATROL_WAYPOINTS[self._wp_idx]
         else:
-            goal = self._thief
+            # Tiene objetivo → ir a última posición conocida
+            goal = self._last_known_pos
 
         self._path = find_path(self._npc, goal, self._grid)
 
     # ── Dibujo ────────────────────────────────────────────────────────────────
-    def _redraw(self):
+    def _redraw(self, feats: dict = None):
         ax = self._ax; ax.cla(); ax.set_facecolor("#16213E")
         W, H   = self._grid.width, self._grid.height
         walls  = self._grid.wall_array()
@@ -440,8 +512,9 @@ class InteractiveGame:
                 boxstyle="round,pad=0.05",
                 facecolor=box_color, edgecolor=box_edge,
                 linewidth=1.5, zorder=6, alpha=0.85))
-            ax.text(spot.x+.5, H-1-spot.y+.5, "📦", ha="center", va="center",
-                    fontsize=9, zorder=7)
+            ax.text(spot.x+.5, H-1-spot.y+.5, "[C]", ha="center", va="center",
+                    fontsize=6, color="white", fontweight="bold",
+                    fontfamily="monospace", zorder=7)
             if is_nearby and not self._hidden:
                 ax.text(spot.x+.5, H-1-spot.y+1.1, "E",
                         ha="center", va="bottom", fontsize=7,
@@ -463,7 +536,7 @@ class InteractiveGame:
                 fontsize=10, color=color, fontweight="bold",
                 fontfamily="monospace", zorder=9)
         if self._hidden:
-            ax.text(W-.2, H-.25-0.7, "🙈 ESCONDIDO", ha="right", va="top",
+            ax.text(W-.2, H-.25-0.7, "** ESCONDIDO **", ha="right", va="top",
                     fontsize=8, color="#5DCAA5", fontweight="bold",
                     fontfamily="monospace", zorder=9)
 
@@ -501,7 +574,7 @@ class InteractiveGame:
 
         # Cooldown / estado hint
         if self._hidden:
-            ax.text(W/2, -1.3, "🙈 escondido — paranoia bajando rápido",
+            ax.text(W/2, -1.3, "[escondido] paranoia bajando rapido",
                     ha="center", va="top", fontsize=7, color="#5DCAA5",
                     fontfamily="monospace", alpha=.9, zorder=9)
         elif self._npc_state in ("alert","investigate") and self._paranoia < 0.35:
