@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pathfinding.astar import Vector2i, find_path
 
 
-# ── Colores por estado ────────────────────────────────────────────────────────
+# Colores por estado
 STATE_COLORS = {
     "patrol":      "#378ADD",
     "alert":       "#EF9F27",
@@ -24,7 +24,6 @@ STATE_LABELS = {
 }
 
 
-# ── Inferencia sobre npc_model.json (sin scikit-learn) ───────────────────────
 class JSONForest:
     def __init__(self, path: str = "models/npc_model.json"):
         with open(path) as f:
@@ -47,8 +46,6 @@ class JSONForest:
             return self._walk(node["left"], x)
         return self._walk(node["right"], x)
 
-
-# ── Grid ──────────────────────────────────────────────────────────────────────
 class GridManager:
     def __init__(self, width, height, walls):
         self.width = width; self.height = height; self._walls = walls
@@ -65,7 +62,6 @@ class GridManager:
         return arr
 
 
-# ── Mapa de la casa ───────────────────────────────────────────────────────────
 class HouseMap:
     WIDTH = 20; HEIGHT = 16
     PATROL_WAYPOINTS = [
@@ -74,12 +70,11 @@ class HouseMap:
     ]
     THIEF_POSITION = Vector2i(14, 12)
 
-    # Cajas donde el ladrón puede esconderse (E para activar cuando estás adyacente)
     HIDING_SPOTS = [
-        Vector2i(2,  2),   # esquina living room
-        Vector2i(16, 2),   # esquina kitchen
-        Vector2i(2,  13),  # esquina bedroom 1
-        Vector2i(16, 13),  # esquina bedroom 2
+        Vector2i(2,  2),  
+        Vector2i(16, 2),  
+        Vector2i(2,  13), 
+        Vector2i(16, 13), 
     ]
 
     @classmethod
@@ -105,7 +100,6 @@ class HouseMap:
                 (4,12,"Bedroom 1"),(14,12,"Bedroom 2")]
 
 
-# ── Feature builder ───────────────────────────────────────────────────────────
 def build_features(npc: Vector2i, thief: Vector2i,
                    paranoia: float, noise: float, has_target: bool) -> dict:
     dist     = math.sqrt((npc.x-thief.x)**2 + (npc.y-thief.y)**2)
@@ -121,7 +115,6 @@ def build_features(npc: Vector2i, thief: Vector2i,
     }
 
 
-# ── Export estático ───────────────────────────────────────────────────────────
 class AStarPlot:
     def __init__(self, grid: GridManager, cell_size: int = 40):
         self._grid = grid
@@ -199,32 +192,15 @@ class AStarPlot:
         return fig
 
 
-# ── Minijuego interactivo ─────────────────────────────────────────────────────
 class InteractiveGame:
-    """
-    Game loop a 10 FPS independiente del input del teclado.
-    El NPC se mueve por su path en cada tick del loop.
-    El ladrón solo se mueve cuando el jugador presiona una flecha.
-
-    Mecánica de estados (espeja Godot):
-    - Sin estímulos → paranoia decae → cuando < 0.3 el modelo predice patrol
-    - Ruido o visibilidad → paranoia sube → alert / investigate / chase
-    - Al perder al ladrón de vista Y sin ruido → paranoia decae gradualmente
-      hasta que el modelo vuelve a patrol (cooldown natural)
-    """
-
     FPS            = 4         # ticks por segundo del NPC
     NPC_STEPS_TICK = 1         # tiles que avanza el NPC por tick
-
-    # Parámetros de simulación calibrados con los rangos del dataset
     NOISE_ON_MOVE    = 0.20    # ruido que genera cada paso del ladrón
     NOISE_DECAY      = 0.03    # decae por tick sin estímulo
     PARANOIA_GAIN    = 0.04    # sube cuando hay alerta/investigación/chase
     PARANOIA_DECAY   = 0.008   # decae por tick sin estímulo (cooldown Godot)
     PARANOIA_FLOOR   = 0.0     # mínimo absoluto
     PARANOIA_CEIL    = 1.0
-
-    # Escondite
     PARANOIA_DECAY_HIDDEN = 0.05   # decae mucho más rápido al esconderse
     HIDE_RANGE            = 1.5    # distancia máxima (tiles) para activar E
 
@@ -241,7 +217,7 @@ class InteractiveGame:
         self._has_target = False
         self._npc_state  = "patrol"
         self._path: list = []
-        self._hidden     = False   # ladrón escondido en caja
+        self._hidden     = False 
 
         # Patrol waypoint cycling cuando está en patrol
         self._wp_idx     = 0
@@ -262,28 +238,21 @@ class InteractiveGame:
         self._update_path()
         self._redraw()
 
-    # ── Input ─────────────────────────────────────────────────────────────────
     def _on_key_press(self, event):
         DIRS = {"up":Vector2i(0,-1),"down":Vector2i(0,1),
                 "left":Vector2i(-1,0),"right":Vector2i(1,0)}
         if event.key == "q":
             self._running = False; plt.close(self._fig); return
-
-        # Tecla E — toggle escondite si hay una caja adyacente
         if event.key == "e":
             with self._lock:
                 if self._hidden:
-                    # Salir del escondite siempre es posible
                     self._hidden = False
                 else:
-                    # Solo esconderse si hay una caja a distancia <= HIDE_RANGE
                     near = self._nearest_hiding_spot()
                     if near is not None:
                         self._hidden = True
-                        self._noise  = 0.0   # silencio inmediato al esconderse
+                        self._noise  = 0.0
             return
-
-        # Movimiento — bloqueado mientras está escondido
         if self._hidden:
             return
 
@@ -297,7 +266,6 @@ class InteractiveGame:
                                      self._noise + self.NOISE_ON_MOVE)
 
     def _nearest_hiding_spot(self):
-        """Devuelve la caja más cercana si está dentro de HIDE_RANGE, o None."""
         tx, ty = self._thief.x, self._thief.y
         for spot in HouseMap.HIDING_SPOTS:
             dist = math.sqrt((tx - spot.x)**2 + (ty - spot.y)**2)
@@ -307,15 +275,12 @@ class InteractiveGame:
 
     def _on_close(self, event):
         self._running = False
-
-    # ── Game loop (hilo separado) ─────────────────────────────────────────────
     def _game_loop(self):
         interval = 1.0 / self.FPS
         while self._running:
             t0 = time.perf_counter()
             with self._lock:
                 self._tick()
-            # Solicitar redibujado en el hilo principal
             try:
                 self._fig.canvas.draw_idle()
                 self._fig.canvas.flush_events()
@@ -324,17 +289,12 @@ class InteractiveGame:
             elapsed = time.perf_counter() - t0
             time.sleep(max(0.0, interval - elapsed))
 
-    # ── Un tick del NPC ───────────────────────────────────────────────────────
     def _tick(self):
-        # 1. Decaimiento pasivo — más rápido si el ladrón está escondido
         decay = self.PARANOIA_DECAY_HIDDEN if self._hidden else self.PARANOIA_DECAY
         self._noise    = max(self.PARANOIA_FLOOR,
                              self._noise - self.NOISE_DECAY)
         self._paranoia = max(self.PARANOIA_FLOOR,
                              self._paranoia - decay)
-
-        # 2. Predicción del modelo
-        # Si está escondido → invisible y sin ruido para el modelo
         feats = build_features(
             self._npc, self._thief,
             self._paranoia,
@@ -346,28 +306,22 @@ class InteractiveGame:
             feats["visibility_score"] = 0.0
         self._npc_state = self._forest.predict(feats)
 
-        # 3. Actualizar paranoia y has_target según estado predicho
         if self._npc_state in ("alert", "investigate", "chase"):
             self._paranoia   = min(self.PARANOIA_CEIL,
                                    self._paranoia + self.PARANOIA_GAIN)
             self._has_target = True
         else:
-            # patrol: si paranoia ya bajó, olvidó al ladrón
             if self._paranoia < 0.3:
                 self._has_target = False
 
-        # 4. Mover NPC por el path
         self._update_path()
         if self._path and len(self._path) > 1:
             self._npc = self._path[1]
 
-        # 5. Redibujar
         self._redraw()
 
-    # ── Pathfinding ───────────────────────────────────────────────────────────
     def _update_path(self):
         if self._npc_state == "patrol":
-            # Cicla entre waypoints cuando no hay estímulos
             goal = HouseMap.PATROL_WAYPOINTS[self._wp_idx]
             if self._npc.x == goal.x and self._npc.y == goal.y:
                 self._wp_idx = (self._wp_idx + 1) % len(HouseMap.PATROL_WAYPOINTS)
@@ -377,7 +331,6 @@ class InteractiveGame:
 
         self._path = find_path(self._npc, goal, self._grid)
 
-    # ── Dibujo ────────────────────────────────────────────────────────────────
     def _redraw(self):
         ax = self._ax; ax.cla(); ax.set_facecolor("#16213E")
         W, H   = self._grid.width, self._grid.height
@@ -386,7 +339,6 @@ class InteractiveGame:
         label  = STATE_LABELS[self._npc_state]
         path_set = {(p.x,p.y) for p in self._path}
 
-        # Celdas
         for y in range(H):
             for x in range(W):
                 iw = walls[y,x]
@@ -398,27 +350,23 @@ class InteractiveGame:
                     (x,H-1-y),1,1,boxstyle="square,pad=0",
                     facecolor=fc,edgecolor=ec,linewidth=0.3))
 
-        # Etiquetas de habitación
         for rx,ry,lbl in HouseMap.room_labels():
             ax.text(rx+.5,H-1-ry+.5,lbl,ha="center",va="center",
                     fontsize=6,color="#8899AA",alpha=.5,zorder=3,
                     fontfamily="monospace")
 
-        # Waypoints de patrulla
         for i,wp in enumerate(HouseMap.PATROL_WAYPOINTS):
             alpha = .9 if (self._npc_state=="patrol" and
                            i==self._wp_idx) else .3
             ax.plot(wp.x+.5,H-1-wp.y+.5,"o",color="#378ADD",
                     markersize=5,zorder=4,alpha=alpha)
 
-        # Línea del path
         if len(self._path) > 1:
             ax.plot([p.x+.5 for p in self._path],
                     [H-1-p.y+.5 for p in self._path],
                     color=color,linewidth=2,zorder=5,
                     solid_capstyle="round",solid_joinstyle="round",alpha=.7)
 
-        # NPC
         nx,ny = self._npc.x, self._npc.y
         ax.add_patch(mpatches.FancyBboxPatch(
             (nx+.1,H-1-ny+.1),.8,.8,boxstyle="round,pad=0.06",
@@ -426,7 +374,6 @@ class InteractiveGame:
         ax.text(nx+.5,H-1-ny+.5,"NPC",ha="center",va="center",
                 fontsize=6,color="#1A1A2E",fontweight="bold",zorder=8)
 
-        # Cajas de escondite
         near_spot = self._nearest_hiding_spot()
         for spot in HouseMap.HIDING_SPOTS:
             is_active  = self._hidden and (spot.x == self._thief.x and spot.y == self._thief.y or
@@ -448,7 +395,6 @@ class InteractiveGame:
                         color="#EF9F27", fontweight="bold",
                         fontfamily="monospace", zorder=8)
 
-        # Ladrón — aparece semitransparente si está escondido
         tx, ty = self._thief.x, self._thief.y
         thief_alpha = 0.25 if self._hidden else 1.0
         ax.text(tx+.5, H-1-ty+.5, "★", ha="center", va="center",
@@ -458,7 +404,6 @@ class InteractiveGame:
         ax.text(tx+.5, H-1-ty-.05, lbl, ha="center", va="top",
                 fontsize=5, color=lbl_color, fontfamily="monospace", zorder=8)
 
-        # Badge de estado + indicador de escondite
         ax.text(W-.2, H-.25, f"● {label}", ha="right", va="top",
                 fontsize=10, color=color, fontweight="bold",
                 fontfamily="monospace", zorder=9)
@@ -467,7 +412,6 @@ class InteractiveGame:
                     fontsize=8, color="#5DCAA5", fontweight="bold",
                     fontfamily="monospace", zorder=9)
 
-        # HUD de features (panel inferior)
         feats = build_features(self._npc,self._thief,
                                self._paranoia,self._noise,self._has_target)
 
@@ -480,7 +424,6 @@ class InteractiveGame:
             ("has_tgt",   "SÍ " if feats['has_investigation_target'] else "NO "),
         ]
 
-        # Barras de progreso para noise y paranoia
         def bar(val, w=10):
             filled = int(val * w)
             return "█"*filled + "░"*(w-filled)
@@ -492,14 +435,12 @@ class InteractiveGame:
             ax.text(x_pos,-0.85,v,ha="left",va="top",fontsize=7.5,
                     color="#AABBCC",fontfamily="monospace",fontweight="bold",zorder=9)
 
-        # Barra visual de paranoia
         ax.text(0.6,-1.3,
                 f"paranoia  {bar(self._paranoia)}  "
                 f"noise  {bar(self._noise)}",
                 ha="left",va="top",fontsize=6.5,
                 color=color,fontfamily="monospace",zorder=9)
 
-        # Cooldown / estado hint
         if self._hidden:
             ax.text(W/2, -1.3, "🙈 escondido — paranoia bajando rápido",
                     ha="center", va="top", fontsize=7, color="#5DCAA5",
@@ -522,8 +463,6 @@ class InteractiveGame:
         plt.show()
         self._running = False
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     MODEL = "models/npc_model.json"
     if not Path(MODEL).exists():
